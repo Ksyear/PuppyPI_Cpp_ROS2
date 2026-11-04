@@ -1,0 +1,16 @@
+PuppyPI_Cpp_ROS2
+Copyright 2026 Ksyear and contributors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Portions of puppy_vr_bridge (Protocol v2 session logic) and puppy_lidar (mapping
+approach) are derived from earlier code in this repository that was published
+under the Apache License, Version 2.0.
+
+The LD06 driver in puppy_lidar was written from the public LD06 serial protocol.
+No code from the LiDAR manufacturer's driver is included.
+
+"PuppyPi" is a product name of Hiwonder. "LD06" is a product name of LDROBOT.
+"Meta Quest" is a trademark of Meta. This project is not affiliated with or
+endorsed by these companies. No source code, binaries, firmware, action files,
+calibration data, preset values or documentation from Hiwonder are included.

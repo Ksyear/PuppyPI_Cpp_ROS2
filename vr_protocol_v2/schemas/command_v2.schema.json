@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "puppypi/protocol-v2/command",
+  "title": "PuppyPi Protocol v2 command (VR → robot, UDP 5001, 1 datagram = 1 UTF-8 JSON object)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol", "type", "client_id", "sequence", "control_active", "forward", "turn"],
+  "properties": {
+    "protocol": {"const": 2},
+    "type": {"const": "command"},
+    "client_id": {"type": "string", "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$", "not": {"const": "00000000-0000-0000-0000-000000000000"}, "description": "VR 연결(Connect)마다 새 UUID. 소켓 자동 재시도 시 유지."},
+    "sequence": {"type": "integer", "minimum": 0, "maximum": 9007199254740991, "description": "명령·이벤트 공용 증가 번호. Unity 는 1부터."},
+    "control_active": {"type": "boolean", "description": "false 이면 forward/turn 값과 관계없이 목표 0"},
+    "forward": {"type": "number", "minimum": -1, "maximum": 1, "description": "단위 없는 정규화 값. +앞으로 기울임"},
+    "turn": {"type": "number", "minimum": -1, "maximum": 1, "description": "단위 없는 정규화 값. +왼쪽으로 기울임(좌회전)"}
+  },
+  "$comment": "JSON 표준상 NaN/Infinity 는 숫자가 아니며, 수신기는 bool(=Python int 하위형)·문자열 숫자·중복 키·추가 필드를 거부한다. 최대 2048 byte."
+}

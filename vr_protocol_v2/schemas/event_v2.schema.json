@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "puppypi/protocol-v2/event",
+  "title": "PuppyPi Protocol v2 event (VR → robot)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol", "type", "client_id", "sequence"],
+  "properties": {
+    "protocol": {"const": 2},
+    "type": {"enum": ["emergency_stop", "clear_emergency", "disconnect"]},
+    "client_id": {"type": "string"},
+    "sequence": {"type": "integer", "minimum": 0, "maximum": 9007199254740991}
+  }
+}

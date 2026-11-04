@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "puppypi/protocol-v2/ack",
+  "title": "PuppyPi Protocol v2 ACK (robot → VR, 보낸 주소로 같은 소켓에서 응답). 정확히 8필드 (Unity V2AckParser.cs)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol", "type", "client_id", "sequence", "accepted", "reason", "emergency_stop", "state"],
+  "properties": {
+    "protocol": {"const": 2},
+    "type": {"const": "ack"},
+    "client_id": {"type": ["string", "null"], "description": "해석 불가 패킷이면 null (Unity 파서는 null ACK 를 무시)"},
+    "sequence": {"type": "integer", "minimum": -1},
+    "accepted": {"type": "boolean"},
+    "reason": {"enum": ["ok", "invalid_packet", "unsupported_protocol", "out_of_order", "not_owner", "emergency_stop", "neutral_required", "fault"]},
+    "emergency_stop": {"type": "boolean"},
+    "state": {"enum": ["idle", "active", "timeout", "emergency_stop", "awaiting_neutral", "fault"]}
+  }
+}

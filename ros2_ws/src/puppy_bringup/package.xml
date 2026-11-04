@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>puppy_bringup</name>
+  <version>2.0.0</version>
+  <description>PuppyPi Media v1 server (camera and LiDAR map for VR and browsers, port 8090) and USB camera mode selector.</description>
+  <maintainer email="72062965+Ksyear@users.noreply.github.com">Ksyear</maintainer>
+  <license>Apache-2.0</license>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>web_video_server</exec_depend>
+  <export><build_type>ament_python</build_type></export>
+</package>

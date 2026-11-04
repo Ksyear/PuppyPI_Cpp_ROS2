@@ -1,0 +1,278 @@
+#!/usr/bin/env python3
+"""USB 카메라 1대를 골라 usb_cam launch 인자를 한 줄로 출력한다(진단은 stderr).
+
+선택 순서: CAMERA_DEVICE(직접 지정) → /dev/v4l/by-id 이름에 CAMERA_NAME 이 든 장치 → 첫 USB 카메라 → /dev/video0.
+usb_cam 0.8.1 에는 실제 장치 경로(/dev/videoN)를 넘긴다. by-id 심볼릭 링크를 그대로 주면 usb_cam 이
+"/dev/" + 링크 대상(../../video0) 으로 바꿔 장치를 못 찾고 종료한다(usb_cam_node.cpp resolve_device_path).
+모드: `v4l2-ctl --list-formats-ext` 로 카메라가 실제 지원하는 모드를 읽어
+  1) MJPG 가 있으면 MAX_WIDTH×MAX_HEIGHT 이하에서 가장 큰 해상도, MIN_FPS 이상 중 가장 높은 fps(MAX_FPS 이하)
+     → pixel_format mjpeg2rgb (usb_cam 이 디코딩해 /usb_cam/image_raw 발행, image_transport 가 .../compressed 발행)
+     usb_cam 0.8.1 의 raw_mjpeg 는 압축 토픽을 발행하지 않는다(노드가 "mjpeg" 이름만 압축 경로로 처리) → 쓰지 않음.
+     mjpeg2rgb 는 색 변환을 av_device_format 으로 고정하므로, 한 프레임을 받아 JPEG 색 샘플링(4:2:2/4:2:0/4:4:4)을 읽어 맞춘다.
+  2) MJPG 가 없으면 YUYV 640×480 이하 → yuyv2rgb
+/usb_cam/image_raw/compressed 의 JPEG 품질은 JPEG_QUALITY(기본 80; image_transport 기본 95 는 Wi-Fi 대역폭 약 2배).
+밝기 등 카메라 조정값: usb_cam 0.8.1 은 brightness 를 기본 50 으로 강제한다(원본 ROS1 usb_cam 은 -1 = 그대로 둠). 카메라는
+그 값을 다시 꽂을 때까지 기억하므로, 시작할 때마다 카메라 자체 기본값으로 되돌리고 자동 노출·자동 화이트밸런스를 켠다
+(커널 5.15 이름 auto_exposure/white_balance_automatic 과 옛 이름 모두). camera.env 의 CTRL_<이름>=값 이 마지막에 덮어쓴다.
+설정: /etc/puppypi/camera.env (KEY=VALUE). 시험용: PUPPYPI_CAMERA_ENV, PUPPYPI_V4L_BYID, PUPPYPI_VIDEO0, PUPPYPI_V4L2CTL
+"""
+
+import glob
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+DEFAULT_AV_FORMAT = "YUVJ422P"  # UVC 카메라 MJPEG 에서 가장 흔한 4:2:2(전체 범위)
+AV_FORMAT_BY_SAMPLING = {(2, 1): "YUVJ422P", (2, 2): "YUVJ420P", (1, 1): "YUVJ444P"}
+
+
+def log(msg):
+    print("puppypi-camera-detect: " + msg, file=sys.stderr)
+
+
+def load_env(path):
+    env = {}
+    try:
+        with open(path, encoding="utf-8") as fp:
+            for line in fp:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    env[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return env
+
+
+def parse_modes(text):
+    """v4l2-ctl --list-formats-ext 출력 → [(fourcc, w, h, fps)]"""
+    modes, fourcc, size = [], None, None
+    for line in text.splitlines():
+        m = re.search(r"\[\d+\]:\s*'(\w{3,4})'", line)
+        if m:
+            fourcc, size = m.group(1), None
+            continue
+        m = re.search(r"Size:\s*\w+\s+(\d+)x(\d+)", line)
+        if m:
+            size = (int(m.group(1)), int(m.group(2)))
+            continue
+        m = re.search(r"\(([\d.]+)\s*fps\)", line)
+        if m and fourcc and size:
+            modes.append((fourcc, size[0], size[1], float(m.group(1))))
+    return modes
+
+
+def choose_mode(modes, max_w, max_h, min_fps, max_fps):
+    """(pixel_format, w, h, fps) 또는 None"""
+    mj = [m for m in modes if m[0] in ("MJPG", "JPEG") and m[1] <= max_w and m[2] <= max_h and min_fps <= m[3] <= max_fps + 0.01]
+    if mj:
+        best = max(mj, key=lambda m: (m[1] * m[2], m[3]))
+        return "mjpeg2rgb", best[1], best[2], best[3]
+    yu = [m for m in modes if m[0] == "YUYV" and m[1] <= 640 and m[2] <= 480 and m[3] <= max_fps + 0.01]
+    if yu:
+        best = max(yu, key=lambda m: (m[1] * m[2], m[3]))
+        return "yuyv2rgb", best[1], best[2], best[3]
+    return None
+
+
+def jpeg_sampling(data):
+    """JPEG 바이트열의 첫 SOF 에서 Y 성분 (H, V) 샘플링 계수. 세그먼트를 따라가며 찾는다. 없으면 None"""
+    i = data.find(b"\xff\xd8")
+    if i < 0:
+        return None
+    i += 2
+    while i + 4 <= len(data):
+        if data[i] != 0xFF:
+            return None
+        marker = data[i + 1]
+        if marker == 0xFF:  # 채움 바이트
+            i += 1
+            continue
+        if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+            i += 2
+            continue
+        seglen = int.from_bytes(data[i + 2:i + 4], "big")
+        if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+            seg = data[i + 4:i + 2 + seglen]
+            if len(seg) >= 9 and seg[5] >= 1:  # 정밀도, 높이, 너비, 성분 수, 첫 성분(id, HV, Tq)
+                hv = seg[7]
+                return (hv >> 4, hv & 0x0F)
+            return None
+        if marker in (0xDA, 0xD9):  # 스캔 시작·끝까지 SOF 없음
+            return None
+        i += 2 + seglen
+    return None
+
+
+def detect_av_format(v4l2ctl, dev, w, h):
+    """MJPG 한 프레임을 받아 usb_cam mjpeg2rgb 의 av_device_format 을 정한다."""
+    with tempfile.TemporaryDirectory() as tmp:
+        out = os.path.join(tmp, "frame.mjpg")
+        try:
+            subprocess.run([v4l2ctl, "-d", dev, "--set-fmt-video=width=%d,height=%d,pixelformat=MJPG" % (w, h),
+                            "--stream-mmap=3", "--stream-count=3", "--stream-to=" + out],
+                           capture_output=True, timeout=8)
+            with open(out, "rb") as fp:
+                data = fp.read()
+        except (OSError, subprocess.SubprocessError) as exc:
+            log("프레임 확인 실패(%s) → %s" % (exc, DEFAULT_AV_FORMAT))
+            return DEFAULT_AV_FORMAT
+    hv = jpeg_sampling(data)
+    fmt = AV_FORMAT_BY_SAMPLING.get(hv)
+    if fmt is None:
+        log("JPEG 샘플링 %s 을 알 수 없음 → %s" % (hv, DEFAULT_AV_FORMAT))
+        return DEFAULT_AV_FORMAT
+    log("JPEG 샘플링 Y %dx%d → av_device_format %s" % (hv[0], hv[1], fmt))
+    return fmt
+
+
+# 시작마다 카메라 기본값으로 되돌리는 화질 조정값(usb_cam 이 바꿀 수 있는 것 + 흔한 UVC 조정값)
+RESET_TO_DEFAULT = ("brightness", "contrast", "saturation", "hue", "gamma", "gain", "sharpness", "backlight_compensation")
+AUTO_EXPOSURE_NAMES = ("auto_exposure", "exposure_auto")  # 커널 5.15 / 옛 이름. 메뉴 3 = 자동(조리개 우선)
+AUTO_WB_NAMES = ("white_balance_automatic", "white_balance_temperature_auto")
+
+
+def parse_ctrls(text):
+    """v4l2-ctl --list-ctrls 출력 → {이름: {"type", "min", "max", "default", "value", "inactive"}}"""
+    ctrls = {}
+    for line in text.splitlines():
+        m = re.match(r"\s*(\w+)\s+0x[0-9a-fA-F]+\s+\((\w+)\)\s*:\s*(.*)$", line)
+        if not m:
+            continue
+        info = {"type": m.group(2), "inactive": False}
+        for k, v in re.findall(r"(\w+)=(\S+)", m.group(3)):
+            if k == "flags":
+                info["inactive"] = "inactive" in v.split(",")
+            else:
+                try:
+                    info[k] = int(v)
+                except ValueError:
+                    pass
+        ctrls[m.group(1)] = info
+    return ctrls
+
+
+def plan_controls(ctrls, env):
+    """바꿀 [(이름, 값, 이유)]. 현재 값과 같으면 생략, inactive 는 바꿀 수 없으므로 생략."""
+    want = {}
+    for name in RESET_TO_DEFAULT:
+        c = ctrls.get(name)
+        if c and "default" in c:
+            want[name] = (c["default"], "카메라 기본값")
+    for name in AUTO_EXPOSURE_NAMES:
+        c = ctrls.get(name)
+        if c:
+            want[name] = (3 if c.get("max", 0) >= 3 else c.get("default", 3), "자동 노출")
+    for name in AUTO_WB_NAMES:
+        if name in ctrls:
+            want[name] = (1, "자동 화이트밸런스")
+    for key, raw in env.items():
+        if not key.startswith("CTRL_") or raw == "":
+            continue
+        name = key[5:]
+        try:
+            v = int(raw)
+        except ValueError:
+            log("camera.env %s=%s: 정수가 아님 → 무시" % (key, raw))
+            continue
+        c = ctrls.get(name)
+        if c is None:
+            log("camera.env %s: 이 카메라에 %s 조정값이 없음 → 무시" % (key, name))
+            continue
+        lo, hi = c.get("min", v), c.get("max", v)
+        if c.get("type") == "bool":
+            lo, hi = 0, 1
+        if not lo <= v <= hi:
+            log("camera.env %s=%d: 범위 %d~%d 밖 → 무시" % (key, v, lo, hi))
+            continue
+        want[name] = (v, "camera.env")
+    plan = []
+    for name, (v, why) in want.items():
+        c = ctrls[name]
+        if c.get("inactive"):
+            continue
+        if c.get("value") != v:
+            plan.append((name, v, why))
+    return plan
+
+
+def apply_controls(v4l2ctl, dev, env):
+    try:
+        text = subprocess.run([v4l2ctl, "-d", dev, "--list-ctrls"], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError) as exc:
+        log("조정값 조회 실패: %s" % exc)
+        return
+    ctrls = parse_ctrls(text)
+    shown = [n for n in RESET_TO_DEFAULT + AUTO_EXPOSURE_NAMES + AUTO_WB_NAMES if n in ctrls]
+    log("조정값(현재/기본/범위): " + ", ".join("%s=%s/%s/%s~%s" % (n, ctrls[n].get("value"), ctrls[n].get("default"),
+                                                                ctrls[n].get("min", 0), ctrls[n].get("max", 1)) for n in shown))
+    for name, v, why in plan_controls(ctrls, env):
+        r = subprocess.run([v4l2ctl, "-d", dev, "-c", "%s=%d" % (name, v)], capture_output=True, text=True, timeout=5)
+        ok = r.returncode == 0 and not (r.stdout + r.stderr).strip()
+        log("%s %s → %d (%s)%s" % ("설정" if ok else "설정 실패", name, v, why, "" if ok else ": " + (r.stdout + r.stderr).strip()[:120]))
+
+
+def find_device(env, byid, video0):
+    want = env.get("CAMERA_DEVICE", "")
+    if want:
+        if os.path.exists(want):
+            return want
+        log("CAMERA_DEVICE=%s 없음" % want)
+        return None
+    devs = sorted(glob.glob(os.path.join(byid, "*-video-index0")))
+    name = env.get("CAMERA_NAME", "NV50-HD220S")
+    for d in devs:
+        if name and name in os.path.basename(d):
+            return d
+    if devs:
+        return devs[0]
+    return video0 if os.path.exists(video0) else None
+
+
+def main():
+    env = load_env(os.environ.get("PUPPYPI_CAMERA_ENV", "/etc/puppypi/camera.env"))
+    byid = os.environ.get("PUPPYPI_V4L_BYID", "/dev/v4l/by-id")
+    video0 = os.environ.get("PUPPYPI_VIDEO0", "/dev/video0")
+    v4l2ctl = os.environ.get("PUPPYPI_V4L2CTL") or shutil.which("v4l2-ctl")
+    log("by-id: %s" % (", ".join(os.path.basename(p) for p in sorted(glob.glob(os.path.join(byid, "*")))) or "없음"))
+    found = find_device(env, byid, video0)
+    if found is None:
+        log("카메라 없음 → 카메라 노드 끔(연결 후 sudo systemctl restart puppypi-ros2)")
+        print("use_camera:=false")
+        return 0
+    dev = os.path.realpath(found)
+    max_w = int(env.get("MAX_WIDTH", 1280))
+    max_h = int(env.get("MAX_HEIGHT", 720))
+    max_fps = float(env.get("MAX_FPS", 30))
+    min_fps = float(env.get("MIN_FPS", 15))
+    mode = None
+    if v4l2ctl:
+        try:
+            text = subprocess.run([v4l2ctl, "-d", dev, "--list-formats-ext"], capture_output=True,
+                                  text=True, timeout=5).stdout
+            mode = choose_mode(parse_modes(text), max_w, max_h, min_fps, max_fps)
+        except (OSError, subprocess.SubprocessError) as exc:
+            log("모드 조회 실패: %s" % exc)
+    if mode is None:
+        mode = ("mjpeg2rgb", min(1280, max_w), min(720, max_h), min(30.0, max_fps))
+        log("모드를 알 수 없어 기본값 사용")
+    fmt, w, h, fps = mode
+    if v4l2ctl:
+        apply_controls(v4l2ctl, dev, env)
+    av_fmt = env.get("AV_DEVICE_FORMAT", "")
+    if fmt == "mjpeg2rgb" and not av_fmt:
+        av_fmt = detect_av_format(v4l2ctl, dev, w, h) if v4l2ctl else DEFAULT_AV_FORMAT
+    av_fmt = av_fmt or DEFAULT_AV_FORMAT
+    quality = max(10, min(100, int(env.get("JPEG_QUALITY", 80))))
+    log("카메라 %s (%s) → %s %dx%d @ %.0f fps, av_device_format %s, JPEG 품질 %d"
+        % (found, dev, fmt, w, h, fps, av_fmt, quality))
+    print("use_camera:=true video_device:=%s image_width:=%d image_height:=%d framerate:=%.1f pixel_format:=%s "
+          "av_device_format:=%s jpeg_quality:=%d" % (dev, w, h, fps, fmt, av_fmt, quality))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

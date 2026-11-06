@@ -79,3 +79,31 @@ def test_outputs_pgm_and_render():
     assert pgm.dtype == np.uint8 and set(np.unique(pgm)) <= {0, 205, 254}
     img = m.render()
     assert img.ndim == 3 and img.shape[2] == 3 and max(img.shape[:2]) >= 300
+
+
+def test_live_render_shows_only_latest_scan():
+    m, _errs, _true = _run()
+    img, info = m.render_live_with_info()
+    assert info["display"] == "live" and img.shape[0] == info["height_px"] and img.shape[1] == info["width_px"]
+    assert len(m.last_world) > 30
+    # 같은 창 규칙: render_with_info 와 왼쪽 아래·축척이 같다(VR 좌표 변환이 그대로 맞음)
+    _, info2 = m.render_with_info()
+    for k in ("left_m", "bottom_m", "px_per_m", "width_px", "height_px"):
+        assert info[k] == info2[k], k
+
+
+def test_live_window_keeps_recent_scans_only():
+    m = OccupancyMapper(size_m=10.0)
+    ang = np.linspace(0, 2 * math.pi, 360, endpoint=False)
+    near = OccupancyMapper.scan_points(np.full(360, 1.0), 0.0, ang[1], 0.12, 11.5)   # 1 m 원
+    far = OccupancyMapper.scan_points(np.full(360, 2.0), 0.0, ang[1], 0.12, 11.5)    # 2 m 원
+    m.process(near, now=0.0)
+    m.process(far, now=5.0)
+    img_new, info = m.render_live_with_info(window_s=1.0, now=5.0)    # 1 m 원은 창 밖 → 안 그림
+    img_both, _ = m.render_live_with_info(window_s=10.0, now=5.0)
+    def dark_at(img, x, y):
+        u = int((x - info["left_m"]) * info["px_per_m"]); v = int(info["height_px"] - (y - info["bottom_m"]) * info["px_per_m"])
+        return img[max(0, v - 2):v + 3, max(0, u - 2):u + 3].min() < 200
+    assert dark_at(img_new, 2.0, 0.0) and not dark_at(img_new, 1.0, 0.0)
+    assert dark_at(img_both, 1.0, 0.0) and dark_at(img_both, 2.0, 0.0)
+

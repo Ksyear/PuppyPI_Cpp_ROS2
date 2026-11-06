@@ -1,0 +1,16 @@
+# LiDAR 지도 노드(lidar_mapper) 설정 예. 실행: ros2 run puppy_lidar lidar_mapper --ros-args --params-file <이 파일>
+lidar_mapper:  # 오도메트리 없는 연속 지도작성(mapper_core.py 설명 참고)
+  ros__parameters:
+    map_size_m: 30.0            # 시작 위치가 중앙
+    resolution: 0.05
+    max_range: 11.5
+    min_range: 0.12
+    min_travel_distance: 0.05
+    min_travel_heading: 0.05
+    map_dir: ~/puppypi_maps     # 부팅마다 <날짜_시각>/map.{pgm,yaml,png} + latest.*, 30 s 마다 저장
+    keep_sessions: 30
+    autosave_period: 30.0
+    map_publish_period: 2.0
+    image_publish_period: 0.25  # live 표시는 0.25 s, map 표시는 1.0 s 정도
+    display_mode: live          # live = 화면에 최근 스캔만(위치 추정용 누적 지도는 내부에만). map = 누적 지도(노드 기본값)
+    live_window_sec: 1.0        # live: 최근 이 시간 안의 스캔만 겹쳐 그림(깜빡임 줄이기, 사라진 물체는 이 안에 지워짐)

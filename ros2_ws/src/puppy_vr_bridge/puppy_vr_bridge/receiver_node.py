@@ -12,17 +12,20 @@ cm/s·rad/s 로 바꾼 뒤 TwistStamped(m/s)로 내보낸다.
 
 import json
 import logging
+import math
 import socket
 import threading
 import time
 
 import rclpy
 import rclpy.executors
-from geometry_msgs.msg import TwistStamped
+from geometry_msgs.msg import PoseStamped, TwistStamped
 from rclpy.node import Node
-from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
+from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
 
+from .path_follower import FollowerConfig, PathFollower, scan_to_points
 from .protocol_v2 import SlewLimiter, StartHold, V2Session
 from .v2_server import V2UdpServer
 
@@ -60,6 +63,8 @@ class VrProtocolV2Receiver(Node):
         # 후진 환산 폭. 0 = max_reverse 와 같음(이전 동작). 상한은 항상 max_reverse.
         self.reverse_scale = float(p("reverse_scale_cm_s", 0.0).value)
         self.start_hold = float(p("start_hold_sec", 0.0).value)  # 0 = 끔
+        # 회전 중 |x| 가 이 값보다 작으면 0 → 제자리 회전 자세 유지(0 = 끔)
+        self.turn_x_deadband = float(p("turn_x_deadband_cm_s", 0.0).value)
         self.max_yaw = float(p("max_yaw_rate_rad_s", 0.28).value)
         self.accel_lin = float(p("max_linear_accel_cm_s2", 0.0).value)  # 0 = 제한 없음(vr_bridge.yaml 설명)
         self.accel_yaw = float(p("max_yaw_accel_rad_s2", 0.0).value)
@@ -74,6 +79,15 @@ class VrProtocolV2Receiver(Node):
         self.discovery_enabled = bool(p("discovery.enabled", True).value)
         self.discovery_port = int(p("discovery.port", 5002).value)
         self.discovery_name = p("discovery.name", "").value
+        # 경로 지정 주행(2026-11-05): VR 이 지도 위 경유점을 보내면 '제자리 회전 → 직진' 으로 따라가고 장애물에서 멈춘다.
+        self.path_enabled = bool(p("path.enabled", True).value)
+        d = FollowerConfig()
+        self.path_cfg = FollowerConfig(**{k: type(getattr(d, k))(p("path." + k, getattr(d, k)).value)
+                                          for k in d.__dataclass_fields__})
+        self.pose_topic = p("path.pose_topic", "/lidar_map/pose").value
+        self.scan_topic = p("path.scan_topic", "/scan").value
+        self.laser_offset = (float(p("path.laser_x", 0.0).value), float(p("path.laser_y", 0.0).value),
+                             float(p("path.laser_yaw", 0.0).value))
         self._validate()
 
         handler = _RosLogHandler(self)
@@ -102,14 +116,24 @@ class VrProtocolV2Receiver(Node):
         self._last_stats_log = time.monotonic()
         self._last_state_pub = 0.0
         self.discovery = None  # 서버 시작 직후 상태 알림이 이 속성을 읽는다
+        self._follower = PathFollower(self.path_cfg)
+        self._pose = None  # (x, y, yaw) 지도 좌표
+        self._pose_t = 0.0
+        self._scan_pts = None  # 로봇 기준 점
+        self._scan_t = 0.0
+        self._last_path_key = None
+        if self.path_enabled:
+            self.create_subscription(PoseStamped, self.pose_topic, self._on_pose, 10)
+            self.create_subscription(LaserScan, self.scan_topic, self._on_scan, qos_profile_sensor_data)
 
         session = V2Session(self.max_forward, self.max_reverse, self.max_yaw,
                             self.command_timeout, self.lease_timeout,
                             accept_estop_from_any_client=self.estop_any,
-                            reverse_scale=self.reverse_scale if self.reverse_scale > 0 else None)
+                            reverse_scale=self.reverse_scale if self.reverse_scale > 0 else None,
+                            turn_x_deadband=self.turn_x_deadband)
         self.server = V2UdpServer(
             session, self._on_output, self.bind_address, self.port, self.poll_interval,
-            on_estop=self._on_estop, on_state=self._on_state,
+            on_estop=self._on_estop, on_state=self._on_state, on_path=self._on_path,
         )
         # 중재기 상태를 받기 전에는 이동을 허용하지 않는다(부팅 직후 이동 금지).
         self.server.set_motion_permitted(False, "puppy_control 상태 수신 전")
@@ -135,10 +159,10 @@ class VrProtocolV2Receiver(Node):
         self.create_timer(1.0 / 50.0, self._tick)
         self.get_logger().info(
             "Protocol v2 수신 %s:%d → %s (x≤+%.1f/-%.1f cm/s, 후진 환산 %.1f, |yaw|≤%.2f rad/s, "
-            "watchdog %.2fs, lease %.1fs, 출발 대기 %.2fs)"
+            "watchdog %.2fs, lease %.1fs, 출발 대기 %.2fs, 회전 중 전후진 무시 <%.1f cm/s)"
             % (self.bind_address, self.server.bound_port, self.output_topic, self.max_forward,
                self.max_reverse, self.reverse_scale if self.reverse_scale > 0 else self.max_reverse,
-               self.max_yaw, self.command_timeout, self.lease_timeout, self.start_hold))
+               self.max_yaw, self.command_timeout, self.lease_timeout, self.start_hold, self.turn_x_deadband))
 
     def _validate(self):
         positive = dict(command_timeout_sec=self.command_timeout, client_lease_timeout_sec=self.lease_timeout,
@@ -150,6 +174,8 @@ class VrProtocolV2Receiver(Node):
         if self.lease_timeout <= self.command_timeout:
             raise ValueError("client_lease_timeout_sec 는 command_timeout_sec 보다 커야 합니다")
         # 보행 엔진이 받는 범위(|x|<=35 cm/s, |yaw|<=51°/s) 밖의 상한은 쓰지 않는다.
+        if not (0.0 <= self.turn_x_deadband <= 25.0):
+            raise ValueError("turn_x_deadband_cm_s 는 0~25 cm/s 여야 합니다")
         if not (0.0 <= self.start_hold <= 1.0):
             raise ValueError("start_hold_sec 는 0~1 s 여야 합니다")
         if self.reverse_scale < 0 or self.reverse_scale > 35:
@@ -162,12 +188,41 @@ class VrProtocolV2Receiver(Node):
     def _on_output(self, velocity, reason):
         x, _y, yaw = velocity
         with self._lock:
+            if self._follower.active:
+                if x == 0.0 and yaw == 0.0 and reason == "command":
+                    return  # 경로 주행 중 VR 의 중립 패킷(정상 heartbeat)은 무시
+                # 조이스틱 조작, watchdog·lease 만료, 비상정지, 중재기 차단 → 경로 취소하고 아래 처리
+                self._follower.cancel("수동 조작" if (x or yaw) else reason)
             self._target = (x, yaw)
             if x == 0.0 and yaw == 0.0:
                 # 정지는 평활화보다 우선: 즉시 0 을 발행한다.
                 self._slew.reset()
                 self._start_hold.reset()
                 self._publish_locked(0.0, 0.0)
+
+    def _on_path(self, path, owner):
+        now = time.monotonic()
+        with self._lock:
+            if path == ():
+                self._follower.cancel("VR 취소")
+            elif self.path_enabled:
+                self._follower.set_path(path, owner, now)
+                self._target = (0.0, 0.0)
+        self._publish_state(force=True)
+
+    def _on_pose(self, msg: PoseStamped):
+        q = msg.pose.orientation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        with self._lock:
+            self._pose = (msg.pose.position.x, msg.pose.position.y, yaw)
+            self._pose_t = time.monotonic()
+
+    def _on_scan(self, msg: LaserScan):
+        pts = scan_to_points(msg.ranges, msg.angle_min, msg.angle_increment, msg.range_min, msg.range_max,
+                             self.laser_offset)
+        with self._lock:
+            self._scan_pts = pts
+            self._scan_t = time.monotonic()
 
     def _on_estop(self, latched: bool):
         msg = String()
@@ -201,7 +256,28 @@ class VrProtocolV2Receiver(Node):
         self.server.check_timeouts()
         if self._last_arbiter_rx is not None and now - self._last_arbiter_rx > self.arbiter_timeout:
             self.server.set_motion_permitted(False, "puppy_control 상태 %.1fs 미수신" % self.arbiter_timeout)
+        # 잠금 순서: 서버 잠금을 먼저 놓고 노드 잠금을 잡는다(서버 스레드는 서버 잠금 안에서 _on_output 을 부른다).
+        with self.server.lock:
+            sess_state, sess_owner = self.server.session.state, self.server.session.owner
+        path_changed = False
         with self._lock:
+            if self._follower.active:
+                if sess_state not in ("idle", "active"):
+                    self._follower.cancel("세션 %s" % sess_state)
+                elif sess_owner != self._follower.owner:
+                    self._follower.cancel("조종자 바뀜")
+                if self._follower.active:
+                    fx, fyaw = self._follower.update(now, self._pose, self._pose_t, self._scan_pts, self._scan_t)
+                    self._target = (fx, fyaw)
+                else:
+                    self._target = (0.0, 0.0)
+                    self._start_hold.reset()
+                    self._slew.reset()
+            key = (self._follower.state, self._follower.index, self._follower.waiting)
+            if key != self._last_path_key:
+                self._last_path_key, path_changed = key, True
+                if not self._follower.active and self._target != (0.0, 0.0) and self._follower.state in ("done", "cancelled"):
+                    self._target = (0.0, 0.0)
             tx, tyaw = self._target
             hx, hyaw = self._start_hold.update(tx, tyaw, now)
             ox, oyaw = self._slew.update(hx, hyaw, now)
@@ -209,7 +285,9 @@ class VrProtocolV2Receiver(Node):
             due = now - self._last_pub_time >= 1.0 / self.publish_rate
             if changed or due:
                 self._publish_locked(ox, oyaw)
-        if now - self._last_state_pub >= 0.5:
+        if path_changed:
+            self._publish_state(force=True)
+        elif now - self._last_state_pub >= (0.25 if self._follower.active else 0.5):
             self._publish_state()
         if now - self._last_stats_log >= self.stats_log_period:
             self._last_stats_log = now
@@ -238,6 +316,10 @@ class VrProtocolV2Receiver(Node):
         with self._lock:
             snap["output_x_cm_s"], snap["output_yaw_rad_s"] = self._slew.output
             snap["start_hold_pending"] = self._start_hold.pending
+            snap["path"] = self._follower.status(time.monotonic(), self._pose)
+            snap["pose"] = None if self._pose is None else {
+                "x_m": round(self._pose[0], 3), "y_m": round(self._pose[1], 3), "yaw_rad": round(self._pose[2], 4),
+                "age_s": round(time.monotonic() - self._pose_t, 2)}
         snap["arbiter_owner"] = self._arbiter.get("owner")
         if self.discovery is not None:
             snap["discovery_replies"] = self.discovery.replies_sent
@@ -251,6 +333,7 @@ class VrProtocolV2Receiver(Node):
             self.discovery.shutdown()
         self.server.shutdown()
         with self._lock:
+            self._follower.cancel("종료")
             self._target = (0.0, 0.0)
             self._slew.reset()
             self._start_hold.reset()

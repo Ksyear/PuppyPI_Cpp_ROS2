@@ -52,6 +52,9 @@ class LidarMapper(Node):
         self.keep_sessions = int(p("keep_sessions", 30).value)
         self.session = time.strftime(SESSION_FMT)
         self.jpeg_quality = int(p("image_jpeg_quality", 80).value)
+        # map = 누적 지도(이전 방식) | live = 최신 스캔만(2026-11-05, 위치 추정용 지도는 내부에만)
+        self.display_mode = p("display_mode", "map").value
+        self.live_window = float(p("live_window_sec", 1.0).value)  # live: 이 시간 안의 스캔만 겹쳐 그림
         self.proc_ms = []
 
         latched = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL)
@@ -117,7 +120,8 @@ class LidarMapper(Node):
         if not m.initialized or (self.img_pub.get_subscription_count() == 0 and self.info_pub.get_subscription_count() == 0):
             return
         import cv2
-        img, info = m.render_with_info()
+        img, info = (m.render_live_with_info(window_s=self.live_window) if self.display_mode == "live"
+                     else m.render_with_info())
         stamp = self.get_clock().now()
         self.image_seq += 1
         if self.img_pub.get_subscription_count() > 0:

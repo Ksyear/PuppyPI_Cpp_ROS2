@@ -94,12 +94,14 @@ class V2UdpServer:
         on_estop: Optional[Callable[[bool], None]] = None,
         on_state: Optional[Callable[[dict], None]] = None,
         stall_timeout: float = 0.5,
+        on_path: Optional[Callable[[tuple, Optional[str]], None]] = None,
         clock: Callable[[], float] = time.monotonic,
     ):
         self.session = session
         self._on_output = on_output
         self._on_estop = on_estop
         self._on_state = on_state
+        self._on_path = on_path  # (경로 또는 () = 취소, 조종자 UUID)
         self._bind = bind_address
         self._port = int(port)
         self._poll = float(poll_interval)
@@ -280,10 +282,16 @@ class V2UdpServer:
             result = self.session.handle_datagram(data, address, now)
             ack = result.ack
             estop_change = result.estop_change
+            path_owner = self.session.owner
             self.stats.observe(now, len(data), ack)
             if result.velocity is not None:
                 self._emit(result.velocity, result.event or "command")
         self._send(address, ack)
+        if result.path is not None and self._on_path is not None:
+            try:
+                self._on_path(result.path, path_owner)
+            except Exception:
+                LOGGER.exception("경로 전달 실패")
         if estop_change is not None and self._on_estop is not None:
             try:
                 self._on_estop(estop_change)

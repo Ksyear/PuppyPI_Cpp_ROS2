@@ -12,6 +12,8 @@
 """
 
 import math
+import time
+from collections import deque
 
 import numpy as np
 
@@ -41,6 +43,8 @@ class OccupancyMapper(object):
         self.integrations = 0
         self.rejected_jumps = 0
         self.trail = []
+        self.last_world = np.zeros((0, 2))  # 가장 최근 스캔(지도 좌표) — live 표시용
+        self.recent = deque(maxlen=60)  # (시각, 지도 좌표 점) — live 표시용 최근 스캔(2026-11-05)
 
     # ── 좌표 ──
     def to_cells(self, xy):
@@ -115,12 +119,15 @@ class OccupancyMapper(object):
         self.score_map = occ
 
     # ── 한 스캔 처리 ──
-    def process(self, pts):
-        """base 기준 점(N,2) → 갱신된 자세. 점이 30개 미만이면 무시."""
+    def process(self, pts, now=None):
+        """base 기준 점(N,2) → 갱신된 자세. 점이 30개 미만이면 무시. now = 단조 시각(live 표시용, 없으면 현재)."""
         if len(pts) < 30:
             return self.pose.copy()
+        now = time.monotonic() if now is None else now
         self.scans += 1
         if not self.initialized:
+            self.last_world = self._world(self.pose, pts)
+            self.recent.append((now, self.last_world))
             self.integrate(self.pose, pts)
             self.last_integrated = self.pose.copy()
             self.initialized = True
@@ -134,6 +141,8 @@ class OccupancyMapper(object):
             self.rejected_jumps += 1
             est = self.pose.copy()
         self.prev_pose, self.pose = self.pose, est
+        self.last_world = self._world(est, pts)
+        self.recent.append((now, self.last_world))
         moved = math.hypot(est[0] - self.last_integrated[0], est[1] - self.last_integrated[1])
         turned = abs(math.atan2(math.sin(est[2] - self.last_integrated[2]), math.cos(est[2] - self.last_integrated[2])))
         if moved >= self.min_travel or turned >= self.min_turn:
@@ -166,6 +175,57 @@ class OccupancyMapper(object):
             return 0, self.n, 0, self.n
         m = int(margin_m / self.res)
         return (max(0, xs.min() - m), min(self.n, xs.max() + m + 1), max(0, ys.min() - m), min(self.n, ys.max() + m + 1))
+
+    def render_live_with_info(self, max_px=640, window_s=1.0, now=None):
+        """live 표시(2026-11-05): 최근 window_s 초 안의 스캔 점과 로봇만 그린다(오래된 점일수록 흐리게).
+        누적 지도·지나온 길은 그리지 않는다(위치 추정용 지도는 내부에만 둔다). 창·좌표 정보는 render_with_info 와 같은 규칙.
+        한 장만 그리면 보행 흔들림·측정 잡음으로 점이 깜빡여서 짧게 겹친다. 사라진 물체는 window_s 안에 지워진다."""
+        import cv2
+        x0, x1, y0, y1 = self.explored_bounds()
+        w, hgt = x1 - x0, y1 - y0
+        scale = max(1, int(max_px / max(w, hgt)))
+        img = np.full((hgt * scale, w * scale, 3), 235, np.uint8)
+        h = img.shape[0]
+
+        def px(x, y):
+            cx = (x - self.origin) / self.res - x0
+            cy = (y - self.origin) / self.res - y0
+            return int(cx * scale), int(h - cy * scale)
+
+        grid = max(1, int(round(0.5 / self.res)))  # 0.5 m 격자(거리 감)
+        for gx in range(0, w, grid):
+            cv2.line(img, (gx * scale, 0), (gx * scale, h - 1), (215, 215, 215), 1)
+        for gy in range(0, hgt, grid):
+            cv2.line(img, (0, h - gy * scale), (img.shape[1] - 1, h - gy * scale), (215, 215, 215), 1)
+        # 점 그리기(배열 연산): 새 점일수록 진하게(30), 창 끝에 가까울수록 흐리게(170). 255 = 점 없음.
+        now = time.monotonic() if now is None else now
+        window_s = max(0.05, float(window_s))
+        canvas = np.full((h, img.shape[1]), 255, np.uint8)
+        scans = [(t, w) for t, w in self.recent if now - t <= window_s] or ([(now, self.last_world)] if len(self.last_world) else [])
+        for t, wpts in scans:
+            if len(wpts) == 0:
+                continue
+            age = min(1.0, max(0.0, (now - t) / window_s))
+            val = np.uint8(30 + 140 * age)
+            u = (((wpts[:, 0] - self.origin) / self.res - x0) * scale).astype(np.int64)
+            v = (h - ((wpts[:, 1] - self.origin) / self.res - y0) * scale).astype(np.int64)
+            ok = (u >= 0) & (u < canvas.shape[1]) & (v >= 0) & (v < h)
+            u, v = u[ok], v[ok]
+            canvas[v, u] = np.minimum(canvas[v, u], val)
+        r = max(1, scale // 2)
+        canvas = cv2.erode(canvas, np.ones((2 * r + 1, 2 * r + 1), np.uint8))
+        mask = canvas < 255
+        img[mask] = np.repeat(canvas[mask][:, None], 3, axis=1)
+        p0 = px(self.pose[0], self.pose[1])
+        p1 = px(self.pose[0] + 0.35 * math.cos(self.pose[2]), self.pose[1] + 0.35 * math.sin(self.pose[2]))
+        cv2.circle(img, p0, max(3, scale), (0, 0, 230), -1)
+        cv2.arrowedLine(img, p0, p1, (0, 0, 230), max(2, scale // 2), tipLength=0.35)
+        info = {"width_px": int(img.shape[1]), "height_px": int(img.shape[0]),
+                "left_m": float(self.origin + x0 * self.res), "bottom_m": float(self.origin + y0 * self.res),
+                "px_per_m": float(scale / self.res), "resolution_m": float(self.res), "display": "live",
+                "robot": {"x_m": float(self.pose[0]), "y_m": float(self.pose[1]), "yaw_rad": float(self.pose[2]),
+                          "u_px": p0[0], "v_px": p0[1]}}
+        return img, info
 
     def render(self, max_px=640):
         """보기용 BGR 이미지: 탐사 범위만 잘라 확대, 지나온 길(파랑)·현재 자세(빨강 화살표)."""

@@ -20,6 +20,29 @@ vr_protocol_v2_receiver:
     # 엄지·손을 미는 동안의 작은 첫 값(예: 3 cm/s)이 보행 한 주기 동안 고정되어 머뭇거리는 것을 막는다.
     # 정지는 기다리지 않는다. 출발 반응이 이만큼 늦어진다. 0 = 끔.
     start_hold_sec: 0.2
+    # 2026-11-05 회전 중 작은 전진·후진 무시: 회전 입력이 있고 |x| < 이 값이면 x = 0 → 제자리 회전 자세 유지.
+    # 휴대폰 조이스틱으로 좌우를 밀 때 엄지가 조금 위·아래로 가면 '느린 전진(후진) + 회전'이 되어 전진 자세로 돌다
+    # 넘어지는 일이 실기에서 관찰되었다. 0 = 끔.
+    turn_x_deadband_cm_s: 4.0
+    # 2026-11-05 경로 지정 주행: VR 이 지도 위 경유점(지도 좌표 m)을 UDP Protocol v2 `path` 로 보내면
+    # '제자리 회전 → 직진' 으로 따라간다. 직진 중 몸 앞 stop_distance_m 안에 LiDAR 점이 있으면 멈추고 기다린다.
+    # 조이스틱 조작·통신 끊김(watchdog)·비상정지·조종자 교체 → 경로 취소. 속도는 조이스틱 50 % 와 같게.
+    path.enabled: true
+    path.speed_cm_s: 12.5
+    path.yaw_rate: 0.14
+    path.rot_enter_deg: 15.0
+    path.rot_exit_deg: 6.0
+    path.heading_kp: 0.5
+    path.heading_max: 0.05
+    path.arrive_m: 0.10
+    path.pass_m: 0.30
+    path.stop_distance_m: 0.30
+    path.body_front_m: 0.16
+    path.half_width_m: 0.17
+    path.min_obstacle_points: 2
+    path.clear_hold_sec: 1.0
+    path.pose_timeout_sec: 0.6
+    path.scan_timeout_sec: 0.6
     max_yaw_rate_rad_s: 0.28
     # 가감속 제한 0 = 끔. 보행 엔진이 속도를 걸음 주기 단위로 바꾸므로, 램프를 두면 첫 주기에 램프 첫 값이
     # 고정되어 출발이 늦어진다.

@@ -34,6 +34,11 @@ V2_MAX_SEQUENCE = 9007199254740991  # 2**53 - 1, C# long 이지만 JS/double 안
 V2_COMMON_FIELDS = frozenset({"protocol", "type", "client_id", "sequence"})
 V2_COMMAND_FIELDS = V2_COMMON_FIELDS | {"control_active", "forward", "turn"}
 V2_EVENT_TYPES = frozenset({"emergency_stop", "clear_emergency", "disconnect"})
+# 2026-11-05 경로 지정 주행: path = 지도 좌표(m) 경유점 목록, path_cancel = 취소. 조종자만, 중립 확인 뒤에만.
+V2_PATH_FIELDS = V2_COMMON_FIELDS | {"points"}
+V2_PATH_TYPES = frozenset({"path", "path_cancel"})
+MAX_PATH_POINTS = 20
+MAX_PATH_COORD_M = 100.0
 V2_STATES = (
     "idle",
     "active",
@@ -78,6 +83,7 @@ class V2Packet:
     control_active: bool = False
     forward: float = 0.0
     turn: float = 0.0
+    points: Optional[Tuple[Tuple[float, float], ...]] = None  # type == "path" 일 때만
 
     @property
     def is_neutral(self) -> bool:
@@ -140,6 +146,28 @@ def _unit_axis(value) -> Optional[float]:
     return None
 
 
+def _coord(value) -> Optional[float]:
+    if type(value) is int and abs(value) <= MAX_PATH_COORD_M:
+        return float(value)
+    if type(value) is float and math.isfinite(value) and abs(value) <= MAX_PATH_COORD_M:
+        return value
+    return None
+
+
+def _path_points(value):
+    if type(value) is not list or not 1 <= len(value) <= MAX_PATH_POINTS:
+        return None
+    out = []
+    for pt in value:
+        if type(pt) is not list or len(pt) != 2:
+            return None
+        x, y = _coord(pt[0]), _coord(pt[1])
+        if x is None or y is None:
+            return None
+        out.append((x, y))
+    return tuple(out)
+
+
 def parse_v2_packet(data: bytes) -> V2Packet:
     """엄격한 v2 datagram 하나를 해석한다. 누락·추가·중복·자료형 오류는 거부."""
     try:
@@ -168,8 +196,10 @@ def parse_v2_packet(data: bytes) -> V2Packet:
         raise reject("invalid_packet", "type은 문자열이어야 합니다")
     if action == "command":
         required = V2_COMMAND_FIELDS
-    elif action in V2_EVENT_TYPES:
+    elif action in V2_EVENT_TYPES or action == "path_cancel":
         required = V2_COMMON_FIELDS
+    elif action == "path":
+        required = V2_PATH_FIELDS
     else:
         raise reject("invalid_packet", "알 수 없는 type")
 
@@ -185,6 +215,11 @@ def parse_v2_packet(data: bytes) -> V2Packet:
     if echo_sequence == -1:
         raise reject("invalid_packet", "sequence는 0~%d 정수여야 합니다" % V2_MAX_SEQUENCE)
 
+    if action == "path":
+        points = _path_points(payload["points"])
+        if points is None:
+            raise reject("invalid_packet", "points 는 [x, y](m, 유한한 숫자) 1~%d 개여야 합니다" % MAX_PATH_POINTS)
+        return V2Packet(action, echo_id, session_id, raw_sequence, points=points)
     if action != "command":
         return V2Packet(action, echo_id, session_id, raw_sequence)
 
@@ -220,6 +255,7 @@ def normalized_to_velocity(
     max_reverse: float,
     max_yaw_rate: float,
     reverse_scale: Optional[float] = None,
+    turn_x_deadband: float = 0.0,
 ) -> Tuple[float, float, float]:
     """forward/turn(-1~1) → (x cm/s, y cm/s, yaw_rate rad/s).
 
@@ -231,9 +267,12 @@ def normalized_to_velocity(
         scale = max_forward
     else:
         scale = max_reverse if reverse_scale is None else reverse_scale
-    return clamp_velocity(
-        forward * scale, turn * max_yaw_rate, max_forward, max_reverse, max_yaw_rate
-    )
+    x = forward * scale
+    yaw = turn * max_yaw_rate
+    # 회전 중 작은 전진·후진은 0 으로: 제자리 회전 자세를 유지한다(느린 전진 자세로 돌면 넘어짐).
+    if turn_x_deadband > 0.0 and yaw != 0.0 and abs(x) < turn_x_deadband:
+        x = 0.0
+    return clamp_velocity(x, yaw, max_forward, max_reverse, max_yaw_rate)
 
 
 @dataclass(frozen=True)
@@ -242,6 +281,7 @@ class V2Result:
     velocity: Optional[Tuple[float, float, float]]  # 지금 출력할 목표. None 이면 출력 없음
     event: Optional[str] = None  # 상태 전이 로그
     estop_change: Optional[bool] = None  # True=latch, False=해제, None=변화 없음
+    path: Optional[tuple] = None  # 경로 변경: None = 없음, () = 취소, ((x, y), ...) = 새 경로
 
 
 class V2Session:
@@ -261,12 +301,14 @@ class V2Session:
         retired_limit: int = 1024,
         accept_estop_from_any_client: bool = True,
         reverse_scale: Optional[float] = None,
+        turn_x_deadband: float = 0.0,
     ):
         if lease_timeout <= command_timeout:
             raise ValueError("lease_timeout 은 command_timeout 보다 커야 합니다")
         self._max_forward = max_forward
         self._max_reverse = max_reverse
         self._reverse_scale = reverse_scale  # None = max_reverse (이전 동작)
+        self._turn_x_deadband = turn_x_deadband  # 0 = 끔
         self._max_yaw = max_yaw_rate
         self._command_timeout = command_timeout
         self._lease_timeout = lease_timeout
@@ -389,6 +431,7 @@ class V2Session:
                 STOP if result.velocity is None else result.velocity,
                 event,
                 result.estop_change,
+                result.path,
             )
         return result
 
@@ -452,7 +495,7 @@ class V2Session:
         result = self._apply(packet, now)
         if claimed is not None:
             event = claimed if result.event is None else "%s; %s" % (claimed, result.event)
-            result = V2Result(result.ack, result.velocity, event, result.estop_change)
+            result = V2Result(result.ack, result.velocity, event, result.estop_change, result.path)
         return result
 
     def _apply(self, packet: V2Packet, now: float) -> V2Result:
@@ -476,6 +519,18 @@ class V2Session:
             self._retire(self._owner_id)
             self._release_owner()
             return self._accept(packet, STOP, "조종자 disconnect; 소유권 해제")
+        if packet.action in V2_PATH_TYPES:
+            # 이동 목표(_target)·watchdog 은 바꾸지 않는다. 실제 주행은 수신기의 경로 추종기가 한다.
+            if self._fault is not None:
+                return self._reject(packet.client_id, packet.sequence, "fault", None, "fault 중 경로 거부")
+            if self._emergency:
+                return self._reject(packet.client_id, packet.sequence, "emergency_stop", None, "비상정지 중 경로 거부")
+            if not self._neutral_confirmed:
+                return self._reject(packet.client_id, packet.sequence, "neutral_required", None, "중립 확인 전 경로 거부")
+            if packet.action == "path_cancel":
+                return V2Result(self._ack(packet.client_id, packet.sequence, True, "ok"), None, "경로 취소", None, ())
+            return V2Result(self._ack(packet.client_id, packet.sequence, True, "ok"), None,
+                            "경로 설정 %d점" % len(packet.points), None, packet.points)
 
         if packet.is_neutral:
             event = None
@@ -505,7 +560,7 @@ class V2Session:
         self._active = True
         self._target = normalized_to_velocity(
             packet.forward, packet.turn, self._max_forward, self._max_reverse, self._max_yaw,
-            self._reverse_scale,
+            self._reverse_scale, self._turn_x_deadband,
         )
         self._last_command_rx = now
         return self._accept(packet, self._target, None)

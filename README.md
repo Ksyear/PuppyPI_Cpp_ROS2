@@ -9,11 +9,11 @@ Licensed under Apache-2.0.
 
 | 위치 | 내용 |
 |---|---|
-| `ros2_ws/src/puppy_vr_bridge/` | Protocol v2 수신기(UDP 5001), 카메라 UDP 송신기(5006, 받는 앱이 있을 때만 실행) |
+| `ros2_ws/src/puppy_vr_bridge/` | Protocol v2 수신기(UDP 5001), 경로 지정 주행(`path_follower.py`), 카메라 UDP 송신기(5006, 받는 앱이 있을 때만 실행) |
 | `ros2_ws/src/puppy_lidar/` | LDROBOT LD06 드라이버(`/dev/ttyAMA0`, 230400 baud) → `/scan`, 오도메트리 없는 2D 점유격자 지도작성 |
 | `ros2_ws/src/puppy_bringup/` | PuppyPi Media v1 서버(포트 8090), USB 카메라 모드 선택기 `puppypi-camera-detect` |
-| `vr_protocol_v2/` | Protocol v2 JSON 스키마(command·event·ack), ROS 없이 수신기를 띄우는 실행기, 단위 변환표 |
-| `config/` | 로봇 설정 예(`/etc/puppypi/` 에 둔다): `vr_bridge.yaml`, `camera.env`, `ros2.env` |
+| `vr_protocol_v2/` | Protocol v2 JSON 스키마(command·event·ack·path), ROS 없이 수신기를 띄우는 실행기, 단위 변환표 |
+| `config/` | 로봇 설정 예(`/etc/puppypi/` 에 둔다): `vr_bridge.yaml`, `lidar_mapper.yaml`, `camera.env`, `ros2.env` |
 | `vr_unity_addon/` | Unity VR 앱에서 로봇 카메라·LiDAR 지도를 패널로 보는 스크립트 2개 |
 | `tests/` | ROS 없이 도는 pytest 시험 |
 
@@ -69,10 +69,38 @@ QoS: `arbiter_state` 는 RELIABLE + TRANSIENT_LOCAL, depth 1.
 | `forward` < 0 | `forward × reverse_scale_cm_s` 뒤 `-max_reverse_cm_s` 로 제한 | ×10, 상한 5 cm/s |
 | `turn` | `turn × max_yaw_rate_rad_s` | 0.28 rad/s |
 | 출발 대기 | 정지 상태에서 출발할 때만 `start_hold_sec` 뒤 출력. 정지·감속·방향 전환은 바로 | 0.2 s |
+| 회전 중 작은 전진·후진 | 회전 입력이 있고 \|x\| < `turn_x_deadband_cm_s` 이면 x = 0(제자리 회전) | 4 cm/s |
 
 출발 대기를 두는 이유: 보행 엔진은 속도를 걸음 주기 단위로 바꾼다. 엄지나 손을 미는 동안 입력이 작은 값부터
 올라가므로, 처음 받은 작은 속도로 한 주기를 걷고 나서야 빨라진다. 잠깐 기다렸다 출발하면 첫 주기부터 목표에
 가까운 속도로 걷는다. 대신 출발 반응이 그만큼 늦어진다. 0 이면 끈다.
+
+회전 중 작은 전진·후진을 무시하는 이유: 조이스틱을 좌우로 밀 때 손이 조금 위아래로 가면 '느린 전진 + 회전' 이
+된다. 실기에서 이 조합으로 넘어지는 일이 관찰되어, 회전 중 작은 x 는 0 으로 바꿔 제자리 회전으로 돌게 했다.
+
+## 경로 지정 주행 (Protocol v2 확장)
+
+VR 앱이 LiDAR 지도 위에 찍은 경유점을 보내면 로봇이 차례로 따라간다. 조이스틱 직접 조종과 같은 수신기·같은
+안전 규칙을 쓴다. 스키마: `vr_protocol_v2/schemas/path_v2.schema.json`.
+
+- 경로 주행 중에도 VR 은 중립 명령(`forward:0, turn:0`)을 계속 보내 연결을 유지한다. 중립 명령은 경로를 취소하지 않는다.
+- 경로: `{"protocol":2,"type":"path","client_id":"<UUID>","sequence":n,"points":[[x,y],...]}`
+  - 지도 좌표(m, `/lidar_map/pose` 와 같은 좌표계), 점 1~20개, 각 좌표 절댓값 100 이하.
+  - 조종자만, 연결 뒤 중립을 받은 뒤에만 수락. 새 경로는 이전 경로를 바꾼다. ACK 는 명령과 같은 8필드.
+- 취소: `{"protocol":2,"type":"path_cancel","client_id":"<UUID>","sequence":n}`
+- 움직임: 경유점 방향으로 제자리 회전 → 직진. 직진 중에는 작은 방향 보정만 한다(느린 전진 + 큰 회전 조합을 만들지 않음).
+- 장애물: 직진 중 몸 앞 `path.stop_distance_m`(0.30 m) 안, 폭 ±`path.half_width_m`(0.17 m)에 `/scan` 점이 2개 이상이면
+  멈추고 기다린다. 비어 있는 상태가 `path.clear_hold_sec`(1 s) 이어지면 다시 간다. 길을 찾아 돌아가지는 않는다.
+- 멈춤(경로 유지): 로봇 위치(`/lidar_map/pose`)나 `/scan` 이 0.6 s 넘게 끊길 때.
+- 취소: 0 이 아닌 조이스틱 명령, 명령 끊김(watchdog·lease), 비상정지, 조종자 교체, `path_cancel`,
+  로봇 위치가 한 번에 0.25 m 또는 25° 넘게 바뀔 때(지도 초기화·위치 추정 튐).
+- 속도: 기본 12.5 cm/s, 제자리 회전 0.14 rad/s. 설정은 `config/vr_bridge.yaml` 의 `path.*`.
+- 상태: `http://<로봇>:8090/api/path` (state = idle·rotate·drive·blocked·done·cancelled, 경유점, 진행, 막힘 횟수, 지도 위 위치).
+
+한계:
+- 위치는 LiDAR 스캔 맞추기로만 추정한다(오도메트리 없음). 특징이 적은 넓은 곳·긴 복도에서는 흔들릴 수 있다.
+- LD06 은 한 평면(설치 높이)만 본다. 그보다 낮거나 높은 물체는 장애물로 잡지 못한다.
+- 제자리 회전 중에는 장애물 검사를 하지 않는다.
 
 ## PuppyPi Media v1
 
@@ -84,6 +112,11 @@ QoS: `arbiter_state` 는 RELIABLE + TRANSIENT_LOCAL, depth 1.
 | `http://<로봇>:8090/api/media` | 위 주소·형식·주기 안내(JSON) |
 | `http://<로봇>:8090/api/map` | 지도 이미지 좌표 정보(m ↔ 픽셀) |
 | `http://<로봇>:8090/api/status` | 중재 상태·지도 위 로봇 자세 |
+| `http://<로봇>:8090/api/path` | 경로 지정 주행 상태(위 절 참고) |
+
+LiDAR 지도 이미지의 표시 방식은 `lidar_mapper` 의 `display_mode` 로 고른다.
+`map`(노드 기본값)은 누적 지도를, `live` 는 최근 `live_window_sec` 초 안의 스캔과 로봇만 그린다.
+`live` 에서도 위치 추정용 누적 지도는 내부에서 계속 쓰고 `/map` 으로 낸다. 설정 예: `config/lidar_mapper.yaml`.
 
 ## 요구 사항
 
@@ -102,7 +135,7 @@ source install/setup.bash
 
 ros2 run puppy_vr_bridge vr_protocol_v2_receiver --ros-args --params-file /etc/puppypi/vr_bridge.yaml
 ros2 run puppy_lidar ld06_driver
-ros2 run puppy_lidar lidar_mapper
+ros2 run puppy_lidar lidar_mapper --ros-args --params-file /etc/puppypi/lidar_mapper.yaml
 ros2 run puppy_bringup media_server
 ```
 
@@ -115,8 +148,9 @@ python3 -m pip install pytest numpy opencv-python-headless
 python3 -m pytest tests
 ```
 
-2026-11-04 기록: macOS(Python 3.13)에서 106개 통과. ROS 2 Humble 컨테이너(arm64)에서 세 패키지 빌드·수신기
-기동 확인. 실제 로봇에서 이 공개본 그대로 시험한 것은 아니다.
+2026-11-06 기록: macOS(Python 3.13)에서 123개 통과. ROS 2 Humble 컨테이너(arm64)에서 세 패키지 빌드, 수신기·지도
+노드가 `config/` 설정 파일로 기동하는 것 확인. 경로 지정 주행은 ROS 없는 운동 모사기 시험(`tests/test_path_follower.py`)만
+거쳤다. 실제 로봇에서 이 공개본 그대로 시험한 것은 아니다.
 
 ## 안전
 

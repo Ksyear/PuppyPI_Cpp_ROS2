@@ -508,3 +508,96 @@ def test_start_hold_zero_is_off():
     h = StartHold(0.0)
     assert h.update(3.4, 0.0, 0.0) == (3.4, 0.0) and not h.pending
 
+
+def test_turn_x_deadband_keeps_turn_in_place():
+    from puppy_vr_bridge.protocol_v2 import normalized_to_velocity
+    # 끔: 좌회전 + 엄지 살짝 위(0.05 × 25 = 1.25 cm/s) → 그대로
+    assert normalized_to_velocity(0.05, 0.5, 25.0, 5.0, 0.28, 10.0)[0] == 1.25
+    # 켬(4 cm/s): 회전 중 작은 전진·후진은 0
+    x, _, yaw = normalized_to_velocity(0.05, 0.5, 25.0, 5.0, 0.28, 10.0, 4.0)
+    assert x == 0.0 and yaw == 0.14
+    assert normalized_to_velocity(-0.3, -0.5, 25.0, 5.0, 0.28, 10.0, 4.0)[0] == 0.0   # -3 cm/s 후진 + 우회전 → 제자리
+    # 크게 밀며 돌기(곡선)는 그대로
+    assert normalized_to_velocity(0.5, 0.3, 25.0, 5.0, 0.28, 10.0, 4.0)[0] == 12.5
+    # 회전 없으면 작은 전진도 그대로(정밀 접근)
+    assert normalized_to_velocity(0.05, 0.0, 25.0, 5.0, 0.28, 10.0, 4.0)[0] == 1.25
+
+
+def test_session_passes_turn_x_deadband():
+    s = V2Session(25.0, 5.0, 0.28, 0.4, 1.0, reverse_scale=10.0, turn_x_deadband=4.0)
+    assert s._turn_x_deadband == 4.0
+
+
+
+# ───────────── 경로 지정 주행 메시지(2026-11-05) ─────────────
+
+def pathp(seq, points, client=CID, **override):
+    d = {"protocol": 2, "type": "path", "client_id": client, "sequence": seq, "points": points}
+    d.update(override)
+    return json.dumps(d).encode()
+
+
+def test_path_packet_parse_and_limits():
+    from puppy_vr_bridge.protocol_v2 import MAX_PATH_POINTS, parse_v2_packet
+    p = parse_v2_packet(pathp(1, [[1, 0], [1.5, -0.25]]))
+    assert p.action == "path" and p.points == ((1.0, 0.0), (1.5, -0.25))
+    assert parse_v2_packet(ev("path_cancel", 2)).action == "path_cancel"
+    bad = [[], [[1]], [[1, 2, 3]], "x", [[True, 0]], [["1", 0]], [[101, 0]],
+           [[0, 0]] * (MAX_PATH_POINTS + 1)]
+    for pts in bad:
+        with pytest.raises(V2PacketError) as e:
+            parse_v2_packet(pathp(1, pts))
+        assert e.value.reason == "invalid_packet", pts
+    with pytest.raises(V2PacketError):
+        parse_v2_packet(pathp(1, [[1, 0]], extra=1))
+    with pytest.raises(V2PacketError):   # path_cancel 에 points 가 있으면 거부
+        parse_v2_packet(json.dumps({"protocol": 2, "type": "path_cancel", "client_id": CID, "sequence": 1,
+                                    "points": [[0, 0]]}).encode())
+    with pytest.raises(V2PacketError):
+        parse_v2_packet(b'{"protocol":2,"type":"path","client_id":"%s","sequence":1,"points":[[NaN,0]]}' % CID.encode())
+
+
+def test_path_session_rules():
+    h = H()
+    r = h.send(pathp(1, [[1, 0]]))
+    ok(r, False, "neutral_required")
+    assert r.path is None and r.velocity is None
+    h.seq = 1
+    ok(h.neutral(), True, "ok", "idle")
+    h.seq += 1
+    r = h.send(pathp(h.seq, [[1, 0], [1, 1]]))
+    ok(r, True, "ok", "idle")
+    assert r.path == ((1.0, 0.0), (1.0, 1.0)) and r.velocity is None     # 이동 목표는 그대로(0)
+    h.seq += 1
+    r = h.send(ev("path_cancel", h.seq))
+    ok(r, True)
+    assert r.path == ()
+    r = h.send(pathp(h.seq + 1, [[1, 0]], client=OTHER), addr=("192.0.2.99", 1))
+    ok(r, False, "not_owner")
+    h.seq += 1
+    ok(h.send(ev("emergency_stop", h.seq)), True)
+    h.seq += 1
+    r = h.send(pathp(h.seq, [[1, 0]]))
+    ok(r, False, "emergency_stop")
+    assert r.path is None
+
+
+def test_path_callback_from_udp_server():
+    got = []
+    session = V2Session(5.0, 3.0, 0.2, 0.25, 1.0)
+    srv = V2UdpServer(session, lambda v, r: None, "127.0.0.1", 0, on_path=lambda p, o: got.append((p, o)))
+    srv.start()
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(1.0)
+        s.sendto(cmd(1, active=False), ("127.0.0.1", srv.bound_port)); s.recv(2048)
+        s.sendto(pathp(2, [[0.5, 0.0]]), ("127.0.0.1", srv.bound_port))
+        ack = json.loads(s.recv(2048))
+        assert ack["accepted"] is True
+        deadline = time.time() + 1.0
+        while not got and time.time() < deadline:
+            time.sleep(0.01)
+        assert got == [(((0.5, 0.0),), CID)]
+        s.close()
+    finally:
+        srv.shutdown()

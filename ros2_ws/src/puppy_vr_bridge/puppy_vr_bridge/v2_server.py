@@ -18,6 +18,8 @@ from .protocol_v2 import MAX_PACKET_BYTES, STOP, V2Session, encode_ack
 LOGGER = logging.getLogger("puppy_vr_bridge.v2_server")
 
 OutputCallback = Callable[[Tuple[float, float, float], str], None]
+# (경로 또는 () = 취소, 조종자 UUID, 요청 client_id, 요청 sequence). 취소일 때 요청 식별자는 None.
+PathCallback = Callable[[tuple, Optional[str], Optional[str], Optional[int]], None]
 
 
 class RxStats:
@@ -94,14 +96,14 @@ class V2UdpServer:
         on_estop: Optional[Callable[[bool], None]] = None,
         on_state: Optional[Callable[[dict], None]] = None,
         stall_timeout: float = 0.5,
-        on_path: Optional[Callable[[tuple, Optional[str]], None]] = None,
+        on_path: Optional[PathCallback] = None,
         clock: Callable[[], float] = time.monotonic,
     ):
         self.session = session
         self._on_output = on_output
         self._on_estop = on_estop
         self._on_state = on_state
-        self._on_path = on_path  # (경로 또는 () = 취소, 조종자 UUID)
+        self._on_path = on_path
         self._bind = bind_address
         self._port = int(port)
         self._poll = float(poll_interval)
@@ -283,13 +285,15 @@ class V2UdpServer:
             ack = result.ack
             estop_change = result.estop_change
             path_owner = self.session.owner
+            # 실제로 수락한 path 패킷의 식별자. 수신기가 경로를 적용할 때 함께 기록한다(ACK 만으로는 바꾸지 않음).
+            path_request = (ack["client_id"], ack["sequence"]) if result.path else (None, None)
             self.stats.observe(now, len(data), ack)
             if result.velocity is not None:
                 self._emit(result.velocity, result.event or "command")
         self._send(address, ack)
         if result.path is not None and self._on_path is not None:
             try:
-                self._on_path(result.path, path_owner)
+                self._on_path(result.path, path_owner, *path_request)
             except Exception:
                 LOGGER.exception("경로 전달 실패")
         if estop_change is not None and self._on_estop is not None:

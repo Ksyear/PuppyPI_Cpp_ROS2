@@ -89,18 +89,25 @@ VR 앱이 LiDAR 지도 위에 찍은 경유점을 보내면 로봇이 차례로 
   - 조종자만, 연결 뒤 중립을 받은 뒤에만 수락. 새 경로는 이전 경로를 바꾼다. ACK 는 명령과 같은 8필드.
 - 취소: `{"protocol":2,"type":"path_cancel","client_id":"<UUID>","sequence":n}`
 - 움직임: 경유점 방향으로 제자리 회전 → 직진. 직진 중에는 작은 방향 보정만 한다(느린 전진 + 큰 회전 조합을 만들지 않음).
-- 장애물: 직진 중 몸 앞 `path.stop_distance_m`(0.30 m) 안, 폭 ±`path.half_width_m`(0.17 m)에 `/scan` 점이 2개 이상이면
-  멈추고 기다린다. 비어 있는 상태가 `path.clear_hold_sec`(1 s) 이어지면 다시 간다. 길을 찾아 돌아가지는 않는다.
-- 멈춤(경로 유지): 로봇 위치(`/lidar_map/pose`)나 `/scan` 이 0.6 s 넘게 끊길 때.
-- 취소: 0 이 아닌 조이스틱 명령, 명령 끊김(watchdog·lease), 비상정지, 조종자 교체, `path_cancel`,
-  로봇 위치가 한 번에 0.25 m 또는 25° 넘게 바뀔 때(지도 초기화·위치 추정 튐).
+- 장애물: **로봇은 LiDAR 점만으로 멈추지 않는다.** 장애물 판단·경로 취소·우회는 VR 앱이 맡고, 장애물을 확정하면
+  `path_cancel` 을 보낸다(2026-11-11 변경. 이전에는 몸 앞 점이 보이면 멈추고 1 s 비면 다시 갔다).
+- 멈춤(경로 유지): 로봇 위치(`/lidar_map/pose`)나 `/scan` 이 0.6 s 넘게 끊길 때. 제자리 회전도 멈춘다.
+  다시 들어오면 별도 해제 없이 이어 간다.
+- 취소: 0 이 아닌 조이스틱 명령, 명령 끊김(watchdog·lease), 비상정지, 조종자 교체, 보행 제어 노드의 VR 이동 차단,
+  `path_cancel`, 로봇 위치가 한 번에 0.25 m 또는 25° 넘게 바뀔 때(지도 초기화·위치 추정 튐).
 - 속도: 기본 12.5 cm/s, 제자리 회전 0.14 rad/s. 설정은 `config/vr_bridge.yaml` 의 `path.*`.
-- 상태: `http://<로봇>:8090/api/path` (state = idle·rotate·drive·blocked·done·cancelled, 경유점, 진행, 막힘 횟수, 지도 위 위치).
+- 상태: `http://<로봇>:8090/api/path` 의 `path`
+  - `state` = idle·rotate·drive·done·cancelled (`blocked` 는 더 이상 나오지 않는다. `blocked_count` 는 형식 호환용으로 늘 0)
+  - `request_client_id`·`request_sequence`: 실제로 적용한 `path` 패킷의 `client_id`·`sequence`. 적용 전·식별자 없는 경우 둘 다 `null`.
+    ACK 시점이 아니라 경로를 실제로 적용할 때 바뀌고, done·cancelled 뒤에도 유지되며, 중립 명령·`path_cancel`·거부된
+    요청으로는 바뀌지 않는다. 짧은 경로가 첫 조회 전에 끝나도 VR 이 "이번 요청의 완료" 인지 구분할 수 있다.
+  - 그 밖에 `waiting`(pose·scan 끊김), `reason`, `points`, `index`, `count`(done 이면 index = count), `remaining_m`, `elapsed_s`.
 
 한계:
 - 위치는 LiDAR 스캔 맞추기로만 추정한다(오도메트리 없음). 특징이 적은 넓은 곳·긴 복도에서는 흔들릴 수 있다.
 - LD06 은 한 평면(설치 높이)만 본다. 그보다 낮거나 높은 물체는 장애물로 잡지 못한다.
-- 제자리 회전 중에는 장애물 검사를 하지 않는다.
+- 로봇 쪽 장애물 정지가 없으므로, VR 앱이 장애물 판단을 하지 않거나 `path_cancel` 을 보내지 못하면 로봇은 경로를 계속 간다.
+  통신 자체가 끊기면 watchdog(0.4 s)이 멈춘다.
 
 ## PuppyPi Media v1
 
@@ -148,9 +155,9 @@ python3 -m pip install pytest numpy opencv-python-headless
 python3 -m pytest tests
 ```
 
-2026-11-06 기록: macOS(Python 3.13)에서 123개 통과. ROS 2 Humble 컨테이너(arm64)에서 세 패키지 빌드, 수신기·지도
-노드가 `config/` 설정 파일로 기동하는 것 확인. 경로 지정 주행은 ROS 없는 운동 모사기 시험(`tests/test_path_follower.py`)만
-거쳤다. 실제 로봇에서 이 공개본 그대로 시험한 것은 아니다.
+2026-11-11 기록: macOS(Python 3.13)에서 138개 통과. ROS 2 Humble 컨테이너(arm64)에서 세 패키지 빌드,
+실제 수신기·미디어 서버를 가짜 위치·LiDAR·보행 제어 상태와 함께 띄워 경로 주행(잡음, 짧은 경로, 같은 좌표 재요청,
+취소, 차단, 끊김, 비상정지)을 확인. 경로 지정 주행은 실제 로봇에서 이 공개본 그대로 시험한 것은 아니다.
 
 ## 안전
 

@@ -585,7 +585,7 @@ def test_path_session_rules():
 def test_path_callback_from_udp_server():
     got = []
     session = V2Session(5.0, 3.0, 0.2, 0.25, 1.0)
-    srv = V2UdpServer(session, lambda v, r: None, "127.0.0.1", 0, on_path=lambda p, o: got.append((p, o)))
+    srv = V2UdpServer(session, lambda v, r: None, "127.0.0.1", 0, on_path=lambda *a: got.append(a))
     srv.start()
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -597,7 +597,12 @@ def test_path_callback_from_udp_server():
         deadline = time.time() + 1.0
         while not got and time.time() < deadline:
             time.sleep(0.01)
-        assert got == [(((0.5, 0.0),), CID)]
+        assert got == [(((0.5, 0.0),), CID, CID, 2)]   # (경로, 조종자, 요청 client_id, 요청 sequence)
+        s.sendto(ev("path_cancel", 3), ("127.0.0.1", srv.bound_port)); s.recv(2048)
+        deadline = time.time() + 1.0
+        while len(got) < 2 and time.time() < deadline:
+            time.sleep(0.01)
+        assert got[1] == ((), CID, None, None)                # 취소는 요청 식별자를 넘기지 않음
         s.close()
     finally:
         srv.shutdown()

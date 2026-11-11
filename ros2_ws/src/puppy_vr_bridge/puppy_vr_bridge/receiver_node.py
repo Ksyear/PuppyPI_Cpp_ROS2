@@ -79,7 +79,8 @@ class VrProtocolV2Receiver(Node):
         self.discovery_enabled = bool(p("discovery.enabled", True).value)
         self.discovery_port = int(p("discovery.port", 5002).value)
         self.discovery_name = p("discovery.name", "").value
-        # 경로 지정 주행(2026-11-05): VR 이 지도 위 경유점을 보내면 '제자리 회전 → 직진' 으로 따라가고 장애물에서 멈춘다.
+        # 경로 지정 주행(2026-11-05): VR 이 지도 위 경유점을 보내면 '제자리 회전 → 직진' 으로 따라간다.
+        # 장애물 판단·취소·우회는 VR(MR) 이 맡는다(2026-11-11). 로봇은 위치·LiDAR 가 끊길 때만 멈춘다.
         self.path_enabled = bool(p("path.enabled", True).value)
         d = FollowerConfig()
         self.path_cfg = FollowerConfig(**{k: type(getattr(d, k))(p("path." + k, getattr(d, k)).value)
@@ -200,13 +201,14 @@ class VrProtocolV2Receiver(Node):
                 self._start_hold.reset()
                 self._publish_locked(0.0, 0.0)
 
-    def _on_path(self, path, owner):
+    def _on_path(self, path, owner, request_client_id=None, request_sequence=None):
         now = time.monotonic()
         with self._lock:
             if path == ():
-                self._follower.cancel("VR 취소")
+                self._follower.cancel("VR 취소")  # 취소된 경로의 실행 식별자는 그대로 둔다
             elif self.path_enabled:
-                self._follower.set_path(path, owner, now)
+                # 실행 식별자는 여기(실제 적용 시점)에서만 바뀐다
+                self._follower.set_path(path, owner, now, request_client_id, request_sequence)
                 self._target = (0.0, 0.0)
         self._publish_state(force=True)
 
@@ -258,12 +260,16 @@ class VrProtocolV2Receiver(Node):
             self.server.set_motion_permitted(False, "puppy_control 상태 %.1fs 미수신" % self.arbiter_timeout)
         # 잠금 순서: 서버 잠금을 먼저 놓고 노드 잠금을 잡는다(서버 스레드는 서버 잠금 안에서 _on_output 을 부른다).
         with self.server.lock:
-            sess_state, sess_owner = self.server.session.state, self.server.session.owner
+            sess = self.server.session
+            sess_state, sess_owner, permitted = sess.state, sess.owner, sess.motion_permitted
         path_changed = False
         with self._lock:
             if self._follower.active:
                 if sess_state not in ("idle", "active"):
                     self._follower.cancel("세션 %s" % sess_state)
+                elif not permitted:
+                    # 경로 주행은 세션 이동 목표를 쓰지 않아 중재기 차단 시 정지 출력이 안 나온다(2026-11-11 발견) → 여기서 취소
+                    self._follower.cancel("이동 차단(중재기)")
                 elif sess_owner != self._follower.owner:
                     self._follower.cancel("조종자 바뀜")
                 if self._follower.active:
@@ -273,7 +279,8 @@ class VrProtocolV2Receiver(Node):
                     self._target = (0.0, 0.0)
                     self._start_hold.reset()
                     self._slew.reset()
-            key = (self._follower.state, self._follower.index, self._follower.waiting)
+            f = self._follower
+            key = (f.state, f.index, f.waiting, f.request_client_id, f.request_sequence)
             if key != self._last_path_key:
                 self._last_path_key, path_changed = key, True
                 if not self._follower.active and self._target != (0.0, 0.0) and self._follower.state in ("done", "cancelled"):

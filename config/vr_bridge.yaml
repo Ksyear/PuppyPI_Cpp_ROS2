@@ -25,7 +25,8 @@ vr_protocol_v2_receiver:
     # 넘어지는 일이 실기에서 관찰되었다. 0 = 끔.
     turn_x_deadband_cm_s: 4.0
     # 2026-11-05 경로 지정 주행: VR 이 지도 위 경유점(지도 좌표 m)을 UDP Protocol v2 `path` 로 보내면
-    # '제자리 회전 → 직진' 으로 따라간다. 직진 중 몸 앞 stop_distance_m 안에 LiDAR 점이 있으면 멈추고 기다린다.
+    # '제자리 회전 → 직진' 으로 따라간다. 장애물 판단·취소·우회는 VR(MR) 이 맡는다(2026-11-11): 로봇은 LiDAR 점만으로
+    # 멈추지 않고, MR 이 path_cancel 을 보내면 멈춘다. 위치·LiDAR 가 *_timeout_sec 넘게 끊기면 멈춘다(경로 유지).
     # 조이스틱 조작·통신 끊김(watchdog)·비상정지·조종자 교체 → 경로 취소. 속도는 조이스틱 50 % 와 같게.
     path.enabled: true
     path.speed_cm_s: 12.5
@@ -36,11 +37,6 @@ vr_protocol_v2_receiver:
     path.heading_max: 0.05
     path.arrive_m: 0.10
     path.pass_m: 0.30
-    path.stop_distance_m: 0.30
-    path.body_front_m: 0.16
-    path.half_width_m: 0.17
-    path.min_obstacle_points: 2
-    path.clear_hold_sec: 1.0
     path.pose_timeout_sec: 0.6
     path.scan_timeout_sec: 0.6
     max_yaw_rate_rad_s: 0.28

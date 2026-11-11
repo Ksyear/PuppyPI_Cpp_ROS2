@@ -355,6 +355,10 @@ class V2Session:
         return self._emergency
 
     @property
+    def motion_permitted(self) -> bool:
+        return self._motion_permitted
+
+    @property
     def owner(self) -> Optional[str]:
         return self._owner_id
 
